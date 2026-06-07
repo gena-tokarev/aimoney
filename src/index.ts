@@ -1,0 +1,779 @@
+import "dotenv/config";
+
+import { createReadStream, existsSync } from "node:fs";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+
+import { google, sheets_v4 } from "googleapis";
+import OpenAI from "openai";
+import { Telegraf } from "telegraf";
+import { message } from "telegraf/filters";
+
+type Expense = {
+  date: string;
+  tags: string[];
+  description: string;
+  amount: number;
+  currency: string;
+  raw_text: string;
+};
+
+type SheetExpenseRow = {
+  date: string;
+  tags: string[];
+  description: string;
+  amount: string;
+  currency: string;
+  raw_text: string;
+};
+
+const {
+  TELEGRAM_BOT_TOKEN,
+  OPENAI_API_KEY,
+  GOOGLE_SHEET_ID,
+} = process.env;
+
+if (!TELEGRAM_BOT_TOKEN || !OPENAI_API_KEY || !GOOGLE_SHEET_ID) {
+  throw new Error(
+    "Missing required environment variables. Expected TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, and GOOGLE_SHEET_ID.",
+  );
+}
+
+const credentialsPath = path.resolve(process.cwd(), "credentials.json");
+
+if (!existsSync(credentialsPath)) {
+  throw new Error(`Missing Google service account file: ${credentialsPath}`);
+}
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+const DEFAULT_TRANSCRIPTION_LANGUAGE = "ru";
+const DEFAULT_CURRENCY = "PLN";
+const RECENT_ROWS_LIMIT = 12;
+const OLDER_ROWS_SAMPLE_LIMIT = 8;
+const TAG_EXAMPLES_PER_TAG = 3;
+const FAMILY_CONTEXT = [
+  "Контекст семьи:",
+  "Мы семья из 3 человек.",
+  "Папа Гена, 1990 года рождения.",
+  "Мама Даша, 1992 года рождения.",
+  "Сын Артур, 2001 года рождения.",
+  "Еще есть дедушка Дядя Леша.",
+  "Мы живем в Польше.",
+  "По умолчанию траты идут в злотых.",
+  "Гена работает программистом как ИП. Обычно тратит на продукты, квартиру, счета, садик, бензин, обслуживание машины, отпуск, essential-вещи и налоги по ИП.",
+  "Даша работает подологом как ИП. Обычно тратит на налоги, рабочие расходы, косметику, бьюти-процедуры и продукты.",
+  "Иногда мы покупаем подарки друг другу, подарки Артуру и иногда ходим в рестораны.",
+  "Изредка ездим в Украину, там могут быть траты в гривнах и на что-то специфическое для Украины.",
+].join(" ");
+const INITIAL_TAGS = [
+  "Артур",
+  "Даша",
+  "Гена",
+  "Дядя Леша",
+  "Машина",
+  "Квартира",
+  "Игрушки",
+  "Работа",
+  "Продукты",
+  "Ресторан",
+  "Подарки",
+  "Налоги",
+  "Садик",
+  "Бензин",
+  "Отпуск",
+  "Красота",
+  "Подология",
+  "Счета",
+  "Здоровье",
+  "Развлечения",
+  "Такси",
+  "Медицина",
+  "Образование",
+  "Транспорт",
+  "Одежда/Обувь",
+  "Электроника",
+  "Дом",
+  "Ремонт",
+  "Спорт",
+  "Хобби",
+  "Путешествия",
+  "Алкоголь",
+  "Подписки",
+];
+
+let sheetsClientPromise: Promise<sheets_v4.Sheets> | null = null;
+let firstSheetTitlePromise: Promise<string> | null = null;
+
+bot.start(async (ctx) => {
+  await ctx.reply(
+    "Отправь мне голосовое сообщение с расходами, и я сохраню их в Google Sheets.",
+  );
+});
+
+bot.on(message("voice"), async (ctx) => {
+  try {
+    await ctx.reply("Обрабатываю голосовое сообщение...");
+
+    const voice = ctx.message.voice;
+    const tempDir = path.join(
+      process.cwd(),
+      "tmp",
+      "telegram-voice",
+      randomUUID(),
+    );
+    await mkdir(tempDir, { recursive: true });
+
+    const extension = voice.mime_type?.includes("ogg") ? "ogg" : "bin";
+    const localAudioPath = path.join(tempDir, `${randomUUID()}.${extension}`);
+
+    try {
+      await downloadTelegramVoiceFile(voice.file_id, localAudioPath);
+
+      const transcription = await transcribeAudio(localAudioPath);
+      const expenses = await extractExpenses(transcription);
+
+      if (expenses.length === 0) {
+        await ctx.reply(
+          "Я не нашел в сообщении расходов. Попробуй еще раз и упомяни сумму, валюту и короткое описание.",
+        );
+        return;
+      }
+
+      await appendExpensesToGoogleSheets(expenses);
+      await ctx.reply(buildConfirmationMessage(expenses));
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  } catch (error) {
+    console.error("Voice message handling failed:", error);
+    await ctx.reply(
+      "Не удалось сохранить расход. Попробуй еще раз через минуту.",
+    );
+  }
+});
+
+bot.on(message("text"), async (ctx, next) => {
+  if (ctx.message.text.startsWith("/start")) {
+    await next();
+    return;
+  }
+
+  await ctx.reply("Пожалуйста, отправь голосовое сообщение с расходами.");
+});
+
+bot.catch(async (error, ctx) => {
+  console.error("Unhandled Telegram bot error:", error);
+  try {
+    await ctx.reply("Произошла непредвиденная ошибка. Попробуй еще раз.");
+  } catch (replyError) {
+    console.error("Failed to send Telegram error reply:", replyError);
+  }
+});
+
+async function downloadTelegramVoiceFile(
+  fileId: string,
+  destinationPath: string,
+): Promise<void> {
+  const fileLink = await bot.telegram.getFileLink(fileId);
+  const response = await fetch(fileLink.toString());
+
+  if (!response.ok || !response.body) {
+    throw new Error(
+      `Failed to download Telegram file. HTTP status: ${response.status}`,
+    );
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  await writeFile(destinationPath, Buffer.from(arrayBuffer));
+}
+
+async function transcribeAudio(audioPath: string): Promise<string> {
+  const transcription = await openai.audio.transcriptions.create({
+    file: createReadStream(audioPath),
+    model: "gpt-4o-mini-transcribe",
+    language: DEFAULT_TRANSCRIPTION_LANGUAGE,
+    prompt:
+      "Это сообщение о личных расходах семьи. Ожидаются русские слова, суммы, названия услуг, магазинов типа Жабка и Бедронка и других польских названий, членов семьи и бытовых категорий. Иногда семья ездит в отпуск в другие страны, так что можно услышать и не польские названия.",
+  });
+
+  const text = transcription.text?.trim();
+
+  if (!text) {
+    throw new Error("Speech-to-text returned an empty transcription.");
+  }
+
+  return text;
+}
+
+async function extractExpenses(rawText: string): Promise<Expense[]> {
+  const today = formatLocalDate(new Date());
+  const tableContext = await getSheetContext();
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "expense_list",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            expenses: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  date: { type: "string" },
+                  tags: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  description: { type: "string" },
+                  amount: { type: "number" },
+                  currency: { type: "string" },
+                  raw_text: { type: "string" },
+                },
+                required: [
+                  "date",
+                  "tags",
+                  "description",
+                  "amount",
+                  "currency",
+                  "raw_text",
+                ],
+              },
+            },
+          },
+          required: ["expenses"],
+        },
+      },
+    },
+    messages: [
+      {
+        role: "system",
+        content: [
+          "Извлеки записи о расходах из текста пользователя.",
+          "Вход обычно на русском языке.",
+          FAMILY_CONTEXT,
+          buildTagHistoryPrompt(tableContext.tagsWithDescriptions),
+          buildRecentRowsPrompt(tableContext.recentRows),
+          buildOlderRowsPrompt(tableContext.sampledOlderRows),
+          `Используй ${today} как опорную дату для слов вроде 'сегодня' и 'вчера'.`,
+          "Верни JSON-объект с массивом expenses.",
+          "Все текстовые поля в результате должны быть на русском языке: tags, description и raw_text.",
+          `Если валюта не указана явно, используй ${DEFAULT_CURRENCY}.`,
+          "Для каждого расхода верни date в формате YYYY-MM-DD, tags как массив коротких тегов, description, amount как число, currency как строку и raw_text.",
+          "Создавай от 1 до 4 полезных тегов по смыслу расхода.",
+          "Теги должны быть короткими, понятными и удобными для фильтрации.",
+          "Если в одной фразе несколько расходов, раздели их на отдельные записи.",
+          "Если расходов нет, верни пустой массив expenses.",
+        ].join(" "),
+      },
+      {
+        role: "user",
+        content: rawText,
+      },
+    ],
+  });
+
+  const content = completion.choices[0]?.message?.content;
+
+  if (!content) {
+    throw new Error("OpenAI did not return expense extraction content.");
+  }
+
+  const parsed = JSON.parse(content) as { expenses?: unknown };
+
+  if (!parsed.expenses || !Array.isArray(parsed.expenses)) {
+    throw new Error("Expense extraction payload is missing the expenses array.");
+  }
+
+  const expenses = parsed.expenses
+    .map((expense) => normalizeExpense(expense, rawText))
+    .filter((expense): expense is Expense => expense !== null);
+
+  return resolveExpenseTags(expenses, tableContext.availableTags, tableContext);
+}
+
+function normalizeExpense(expense: unknown, fallbackRawText: string): Expense | null {
+  if (!expense || typeof expense !== "object") {
+    return null;
+  }
+
+  const candidate = expense as Partial<Expense>;
+  const amount =
+    typeof candidate.amount === "number"
+      ? candidate.amount
+      : Number(candidate.amount);
+
+  if (
+    typeof candidate.date !== "string" ||
+    typeof candidate.description !== "string" ||
+    Number.isNaN(amount) ||
+    typeof candidate.currency !== "string" ||
+    !Array.isArray(candidate.tags)
+  ) {
+    return null;
+  }
+
+  return {
+    date: candidate.date,
+    tags: normalizeTags(candidate.tags),
+    description: candidate.description.trim(),
+    amount,
+    currency: normalizeCurrency(candidate.currency),
+    raw_text:
+      typeof candidate.raw_text === "string" && candidate.raw_text.trim()
+        ? candidate.raw_text.trim()
+        : fallbackRawText,
+  };
+}
+
+async function resolveExpenseTags(
+  expenses: Expense[],
+  existingTags: string[],
+  tableContext?: SheetContext,
+): Promise<Expense[]> {
+  if (expenses.length === 0 || existingTags.length === 0) {
+    return expenses;
+  }
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "resolved_expense_tags",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            expenses: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  index: { type: "number" },
+                  tags: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                },
+                required: ["index", "tags"],
+              },
+            },
+          },
+          required: ["expenses"],
+        },
+      },
+    },
+    messages: [
+      {
+        role: "system",
+        content: [
+          "Нормализуй теги расходов.",
+          FAMILY_CONTEXT,
+          "Текст расходов может быть на русском языке.",
+          buildTagHistoryPrompt(tableContext?.tagsWithDescriptions ?? []),
+          buildRecentRowsPrompt(tableContext?.recentRows ?? []),
+          buildOlderRowsPrompt(tableContext?.sampledOlderRows ?? []),
+          `Существующие теги: ${existingTags.join(", ")}.`,
+          "Для каждого расхода переиспользуй существующие теги только если это очевидное совпадение или явный синоним.",
+          "Если существующие теги не подходят по смыслу, создай новые короткие теги.",
+          "Верни от 1 до 4 итоговых тегов для каждого расхода.",
+          "Не добавляй нерелевантные теги только потому, что они уже существуют.",
+          "Все теги должны быть на русском языке, короткими и удобными для фильтрации.",
+        ].join(" "),
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          expenses: expenses.map((expense, index) => ({
+            index,
+            current_tags: expense.tags,
+            description: expense.description,
+            raw_text: expense.raw_text,
+          })),
+        }),
+      },
+    ],
+  });
+
+  const content = completion.choices[0]?.message?.content;
+
+  if (!content) {
+    return expenses;
+  }
+
+  const parsed = JSON.parse(content) as {
+    expenses?: Array<{ index?: number; tags?: string[] }>;
+  };
+
+  if (!parsed.expenses || !Array.isArray(parsed.expenses)) {
+    return expenses;
+  }
+
+  const resolvedByIndex = new Map<number, string[]>();
+
+  for (const item of parsed.expenses) {
+    if (
+      typeof item.index === "number" &&
+      item.index >= 0 &&
+      item.index < expenses.length &&
+      Array.isArray(item.tags)
+    ) {
+      resolvedByIndex.set(item.index, reconcileTags(item.tags, existingTags));
+    }
+  }
+
+  return expenses.map((expense, index) => ({
+    ...expense,
+    tags: resolvedByIndex.get(index) ?? expense.tags,
+  }));
+}
+
+async function appendExpensesToGoogleSheets(expenses: Expense[]): Promise<void> {
+  const sheets = await getSheetsClient();
+  const sheetTitle = await getFirstSheetTitle(sheets);
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${sheetTitle}!A:F`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: {
+      values: expenses.map((expense) => [
+        expense.date,
+        formatTagsForStorage(expense.tags),
+        expense.description,
+        expense.amount,
+        expense.currency,
+        expense.raw_text,
+      ]),
+    },
+  });
+}
+
+type SheetContext = {
+  availableTags: string[];
+  tagsWithDescriptions: Array<{ tag: string; descriptions: string[] }>;
+  recentRows: SheetExpenseRow[];
+  sampledOlderRows: SheetExpenseRow[];
+};
+
+async function getSheetContext(): Promise<SheetContext> {
+  const sheets = await getSheetsClient();
+  const sheetTitle = await getFirstSheetTitle(sheets);
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${sheetTitle}!A:F`,
+  });
+
+  const rows = parseSheetRows(response.data.values ?? []);
+  const availableTags = Array.from(
+    new Map(
+      [...INITIAL_TAGS, ...rows.flatMap((row) => row.tags)]
+        .filter((value) => value.toLowerCase() !== "tags")
+        .map((value) => [value.toLowerCase(), value] as const),
+    ).values(),
+  );
+
+  return {
+    availableTags,
+    tagsWithDescriptions: buildTagDescriptionHistory(rows, availableTags),
+    recentRows: rows.slice(-RECENT_ROWS_LIMIT),
+    sampledOlderRows: sampleOlderRows(rows, RECENT_ROWS_LIMIT, OLDER_ROWS_SAMPLE_LIMIT),
+  };
+}
+
+function parseSheetRows(values: unknown[][]): SheetExpenseRow[] {
+  return Array.from(
+    values
+      .slice(1)
+      .map((row) => ({
+        date: String(row[0] ?? "").trim(),
+        tags: parseStoredTags(String(row[1] ?? "")),
+        description: String(row[2] ?? "").trim(),
+        amount: String(row[3] ?? "").trim(),
+        currency: String(row[4] ?? "").trim(),
+        raw_text: String(row[5] ?? "").trim(),
+      }))
+      .filter((row) => row.date || row.description || row.tags.length > 0),
+  );
+}
+
+async function getSheetsClient(): Promise<sheets_v4.Sheets> {
+  if (!sheetsClientPromise) {
+    sheetsClientPromise = (async () => {
+      const credentials = JSON.parse(
+        await readFile(credentialsPath, "utf8"),
+      ) as Record<string, unknown>;
+
+      const auth = new google.auth.GoogleAuth({
+        credentials,
+        scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+      });
+
+      return google.sheets({
+        version: "v4",
+        auth,
+      });
+    })().catch((error) => {
+      sheetsClientPromise = null;
+      throw error;
+    });
+  }
+
+  return sheetsClientPromise;
+}
+
+async function getFirstSheetTitle(sheets: sheets_v4.Sheets): Promise<string> {
+  if (!firstSheetTitlePromise) {
+    firstSheetTitlePromise = (async () => {
+      const response = await sheets.spreadsheets.get({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        fields: "sheets(properties(title))",
+      });
+
+      const title = response.data.sheets?.[0]?.properties?.title;
+
+      if (!title) {
+        throw new Error("Unable to determine the first sheet title.");
+      }
+
+      return title;
+    })().catch((error) => {
+      firstSheetTitlePromise = null;
+      throw error;
+    });
+  }
+
+  return firstSheetTitlePromise;
+}
+
+function buildConfirmationMessage(expenses: Expense[]): string {
+  const lines = expenses.map(
+    (expense, index) =>
+      `${index + 1}. ${expense.date} | ${expense.amount} ${expense.currency} | ${expense.description} | теги: ${formatTagsForStorage(expense.tags)}`,
+  );
+
+  return [`Сохранил ${expenses.length} расход(ов):`, ...lines].join("\n");
+}
+
+function formatLocalDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+
+  return `${year}-${month}-${day}`;
+}
+
+function normalizeTags(tags: unknown[]): string[] {
+  const normalized = tags
+    .map((tag) => String(tag).trim())
+    .map((tag) => tag.replace(/\s+/g, " "))
+    .map((tag) => tag.replace(/^#+/, ""))
+    .filter(Boolean);
+
+  const uniqueTags = Array.from(new Set(normalized)).slice(0, 4);
+
+  return uniqueTags.length > 0 ? uniqueTags : ["Прочее"];
+}
+
+function reconcileTags(candidateTags: string[], existingTags: string[]): string[] {
+  const normalizedCandidates = normalizeTags(candidateTags);
+
+  return normalizedCandidates.map((candidateTag) => {
+    const existingTag = existingTags.find(
+      (tag) => tag.trim().toLowerCase() === candidateTag.toLowerCase(),
+    );
+
+    return existingTag ?? candidateTag;
+  });
+}
+
+function formatTagsForStorage(tags: string[]): string {
+  return normalizeTags(tags).join(", ");
+}
+
+function parseStoredTags(value: string): string[] {
+  return value
+    .split(/[,\n;|]/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => part.replace(/\s+/g, " "));
+}
+
+function buildTagDescriptionHistory(
+  rows: SheetExpenseRow[],
+  availableTags: string[],
+): Array<{ tag: string; descriptions: string[] }> {
+  const descriptionsByTag = new Map<string, string[]>();
+
+  for (const tag of availableTags) {
+    descriptionsByTag.set(tag, []);
+  }
+
+  for (const row of rows) {
+    for (const rowTag of row.tags) {
+      const matchedTag =
+        availableTags.find(
+          (tag) => tag.trim().toLowerCase() === rowTag.trim().toLowerCase(),
+        ) ?? rowTag;
+
+      const descriptions = descriptionsByTag.get(matchedTag) ?? [];
+      if (row.description && !descriptions.includes(row.description)) {
+        descriptions.push(row.description);
+      }
+      descriptionsByTag.set(matchedTag, descriptions);
+    }
+  }
+
+  return availableTags.map((tag) => ({
+    tag,
+    descriptions: (descriptionsByTag.get(tag) ?? []).slice(-TAG_EXAMPLES_PER_TAG),
+  }));
+}
+
+function buildTagHistoryPrompt(
+  tagsWithDescriptions: Array<{ tag: string; descriptions: string[] }>,
+): string {
+  if (tagsWithDescriptions.length === 0) {
+    return "История тегов пока пустая.";
+  }
+
+  const lines = tagsWithDescriptions.map(({ tag, descriptions }) => {
+    if (descriptions.length === 0) {
+      return `${tag}: без примеров описаний`;
+    }
+
+    return `${tag}: ${descriptions.join(" | ")}`;
+  });
+
+  return `Известные теги и связанные с ними описания: ${lines.join("; ")}.`;
+}
+
+function buildRecentRowsPrompt(rows: SheetExpenseRow[]): string {
+  if (rows.length === 0) {
+    return "Последних записей в таблице пока нет.";
+  }
+
+  const lines = rows.map(
+    (row) =>
+      `${row.date} | ${formatTagsForStorage(row.tags)} | ${row.description} | ${row.amount} ${row.currency} | ${row.raw_text}`,
+  );
+
+  return `Последние записи из таблицы: ${lines.join(" ; ")}.`;
+}
+
+function buildOlderRowsPrompt(rows: SheetExpenseRow[]): string {
+  if (rows.length === 0) {
+    return "Дополнительных старых примеров из таблицы пока нет.";
+  }
+
+  const lines = rows.map(
+    (row) =>
+      `${row.date} | ${formatTagsForStorage(row.tags)} | ${row.description} | ${row.amount} ${row.currency} | ${row.raw_text}`,
+  );
+
+  return `Более старые распределенные примеры из таблицы: ${lines.join(" ; ")}.`;
+}
+
+function sampleOlderRows(
+  rows: SheetExpenseRow[],
+  recentRowsLimit: number,
+  sampleLimit: number,
+): SheetExpenseRow[] {
+  const olderRows = rows.slice(0, Math.max(0, rows.length - recentRowsLimit));
+
+  if (olderRows.length <= sampleLimit) {
+    return olderRows;
+  }
+
+  const sampled: SheetExpenseRow[] = [];
+  const lastIndex = olderRows.length - 1;
+
+  for (let i = 0; i < sampleLimit; i += 1) {
+    const position =
+      sampleLimit === 1
+        ? Math.floor(lastIndex / 2)
+        : Math.round((i * lastIndex) / (sampleLimit - 1));
+    sampled.push(olderRows[position]);
+  }
+
+  return sampled.filter(
+    (row, index, array) =>
+      array.findIndex(
+        (candidate) =>
+          candidate.date === row.date &&
+          candidate.description === row.description &&
+          candidate.amount === row.amount &&
+          candidate.currency === row.currency &&
+          candidate.raw_text === row.raw_text,
+      ) === index,
+  );
+}
+
+function normalizeCurrency(currency: string): string {
+  const value = currency.trim();
+  const normalized = value.toLowerCase();
+
+  if (!normalized) {
+    return DEFAULT_CURRENCY;
+  }
+
+  if (
+    normalized === "zl" ||
+    normalized === "pln" ||
+    normalized === "зл" ||
+    normalized === "злотый" ||
+    normalized === "злотых" ||
+    normalized === "злотые"
+  ) {
+    return "PLN";
+  }
+
+  if (
+    normalized === "eur" ||
+    normalized === "евро"
+  ) {
+    return "EUR";
+  }
+
+  if (
+    normalized === "usd" ||
+    normalized === "доллар" ||
+    normalized === "доллара" ||
+    normalized === "долларов"
+  ) {
+    return "USD";
+  }
+
+  return value.toUpperCase();
+}
+
+async function bootstrap(): Promise<void> {
+  await bot.launch();
+  console.log("Telegram expense bot is running.");
+}
+
+bootstrap().catch((error) => {
+  console.error("Failed to start bot:", error);
+  process.exit(1);
+});
+
+process.once("SIGINT", () => {
+  bot.stop("SIGINT");
+});
+
+process.once("SIGTERM", () => {
+  bot.stop("SIGTERM");
+});

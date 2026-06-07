@@ -1,0 +1,26 @@
+{
+  "name": "telegram-expense-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram expense tracking bot with voice transcription and Google Sheets storage",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "googleapis": "^150.0.1",
+    "openai": "^4.0.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
