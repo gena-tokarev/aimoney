@@ -10,7 +10,10 @@ import OpenAI from "openai";
 import { Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
 
-type Expense = {
+type EntryType = "расход" | "доход";
+
+type Entry = {
+  type: EntryType;
   date: string;
   tags: string[];
   description: string;
@@ -19,7 +22,8 @@ type Expense = {
   raw_text: string;
 };
 
-type SheetExpenseRow = {
+type SheetEntryRow = {
+  type: EntryType;
   date: string;
   tags: string[];
   description: string;
@@ -67,7 +71,7 @@ const FAMILY_CONTEXT = [
   "Иногда мы покупаем подарки друг другу, подарки Артуру и иногда ходим в рестораны.",
   "Изредка ездим в Украину, там могут быть траты в гривнах и на что-то специфическое для Украины.",
 ].join(" ");
-const INITIAL_TAGS = [
+const INITIAL_EXPENSE_TAGS = [
   "Артур",
   "Даша",
   "Гена",
@@ -102,13 +106,26 @@ const INITIAL_TAGS = [
   "Алкоголь",
   "Подписки",
 ];
+const INITIAL_INCOME_TAGS = [
+  "Работа",
+  "Даша",
+  "Гена",
+  "Возврат",
+  "Клиент",
+  "Подология",
+  "Программирование",
+  "Зарплата",
+  "Оплата",
+  "Премия",
+  "Перевод",
+];
 
 let sheetsClientPromise: Promise<sheets_v4.Sheets> | null = null;
 let firstSheetTitlePromise: Promise<string> | null = null;
 
 bot.start(async (ctx) => {
   await ctx.reply(
-    "Отправь мне голосовое сообщение с расходами, и я сохраню их в Google Sheets.",
+    "Отправь мне голосовое сообщение с расходами или доходами, и я сохраню их в Google Sheets.",
   );
 });
 
@@ -132,24 +149,24 @@ bot.on(message("voice"), async (ctx) => {
       await downloadTelegramVoiceFile(voice.file_id, localAudioPath);
 
       const transcription = await transcribeAudio(localAudioPath);
-      const expenses = await extractExpenses(transcription);
+      const entries = await extractEntries(transcription);
 
-      if (expenses.length === 0) {
+      if (entries.length === 0) {
         await ctx.reply(
-          "Я не нашел в сообщении расходов. Попробуй еще раз и упомяни сумму, валюту и короткое описание.",
+          "Я не нашел в сообщении ни расходов, ни доходов. Попробуй еще раз и упомяни сумму, валюту и короткое описание.",
         );
         return;
       }
 
-      await appendExpensesToGoogleSheets(expenses);
-      await ctx.reply(buildConfirmationMessage(expenses));
+      await appendEntriesToGoogleSheets(entries);
+      await ctx.reply(buildConfirmationMessage(entries));
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
   } catch (error) {
     console.error("Voice message handling failed:", error);
     await ctx.reply(
-      "Не удалось сохранить расход. Попробуй еще раз через минуту.",
+      "Не удалось сохранить запись. Попробуй еще раз через минуту.",
     );
   }
 });
@@ -160,7 +177,7 @@ bot.on(message("text"), async (ctx, next) => {
     return;
   }
 
-  await ctx.reply("Пожалуйста, отправь голосовое сообщение с расходами.");
+  await ctx.reply("Пожалуйста, отправь голосовое сообщение с расходами или доходами.");
 });
 
 bot.catch(async (error, ctx) => {
@@ -195,7 +212,7 @@ async function transcribeAudio(audioPath: string): Promise<string> {
     model: "gpt-4o-mini-transcribe",
     language: DEFAULT_TRANSCRIPTION_LANGUAGE,
     prompt:
-      "Это сообщение о личных расходах семьи. Ожидаются русские слова, суммы, названия услуг, магазинов типа Жабка и Бедронка и других польских названий, членов семьи и бытовых категорий. Иногда семья ездит в отпуск в другие страны, так что можно услышать и не польские названия.",
+      "Это сообщение о личных финансах семьи. Ожидаются русские слова, суммы, доходы, расходы, возвраты, названия услуг, магазинов типа Жабка и Бедронка и других польских названий, членов семьи и бытовых категорий. Иногда семья ездит в отпуск в другие страны, так что можно услышать и не польские названия.",
   });
 
   const text = transcription.text?.trim();
@@ -207,7 +224,7 @@ async function transcribeAudio(audioPath: string): Promise<string> {
   return text;
 }
 
-async function extractExpenses(rawText: string): Promise<Expense[]> {
+async function extractEntries(rawText: string): Promise<Entry[]> {
   const today = formatLocalDate(new Date());
   const tableContext = await getSheetContext();
 
@@ -217,18 +234,19 @@ async function extractExpenses(rawText: string): Promise<Expense[]> {
     response_format: {
       type: "json_schema",
       json_schema: {
-        name: "expense_list",
+        name: "finance_entry_list",
         strict: true,
         schema: {
           type: "object",
           additionalProperties: false,
           properties: {
-            expenses: {
+            entries: {
               type: "array",
               items: {
                 type: "object",
                 additionalProperties: false,
                 properties: {
+                  type: { type: "string" },
                   date: { type: "string" },
                   tags: {
                     type: "array",
@@ -240,6 +258,7 @@ async function extractExpenses(rawText: string): Promise<Expense[]> {
                   raw_text: { type: "string" },
                 },
                 required: [
+                  "type",
                   "date",
                   "tags",
                   "description",
@@ -250,7 +269,7 @@ async function extractExpenses(rawText: string): Promise<Expense[]> {
               },
             },
           },
-          required: ["expenses"],
+          required: ["entries"],
         },
       },
     },
@@ -258,21 +277,27 @@ async function extractExpenses(rawText: string): Promise<Expense[]> {
       {
         role: "system",
         content: [
-          "Извлеки записи о расходах из текста пользователя.",
+          "Извлеки финансовые записи из текста пользователя.",
           "Вход обычно на русском языке.",
           FAMILY_CONTEXT,
-          buildTagHistoryPrompt(tableContext.tagsWithDescriptions),
+          buildTagHistoryPrompt("расход", tableContext.expenseTagsWithDescriptions),
+          buildTagHistoryPrompt("доход", tableContext.incomeTagsWithDescriptions),
           buildRecentRowsPrompt(tableContext.recentRows),
           buildOlderRowsPrompt(tableContext.sampledOlderRows),
           `Используй ${today} как опорную дату для слов вроде 'сегодня' и 'вчера'.`,
-          "Верни JSON-объект с массивом expenses.",
+          "Верни JSON-объект с массивом entries.",
           "Все текстовые поля в результате должны быть на русском языке: tags, description и raw_text.",
           `Если валюта не указана явно, используй ${DEFAULT_CURRENCY}.`,
-          "Для каждого расхода верни date в формате YYYY-MM-DD, tags как массив коротких тегов, description, amount как число, currency как строку и raw_text.",
-          "Создавай от 1 до 4 полезных тегов по смыслу расхода.",
+          "Для каждой записи верни type как 'расход' или 'доход', date в формате YYYY-MM-DD, tags как массив коротких тегов, description, amount как число, currency как строку и raw_text.",
+          "Ожидай и расходы, и доходы.",
+          "Примеры доходов: 'Клиент заплатил 100 злотых', 'Заработала 500 злотых', 'Получил 1000 злотых', 'Вернули 500 злотых'.",
+          "Возврат денег, вернули деньги, возврат от магазина или клиента считай доходом, если это поступление денег обратно.",
+          "Для расходов используй расходные теги. Для доходов используй только доходные теги или новые подходящие доходные теги.",
+          "Создавай от 1 до 4 полезных тегов по смыслу записи.",
           "Теги должны быть короткими, понятными и удобными для фильтрации.",
-          "Если в одной фразе несколько расходов, раздели их на отдельные записи.",
-          "Если расходов нет, верни пустой массив expenses.",
+          "Если в одной записи перечислены несколько сумм для одного и того же события, не создавай несколько одинаковых записей. Сложи суммы и верни одну запись. Например: 'Сегодня заработала 350, 500 и 1000 злотых' => одна запись с amount 1850.",
+          "Если в одной фразе несколько финансовых событий, раздели их на отдельные записи.",
+          "Если финансовых записей нет, верни пустой массив entries.",
         ].join(" "),
       },
       {
@@ -285,34 +310,35 @@ async function extractExpenses(rawText: string): Promise<Expense[]> {
   const content = completion.choices[0]?.message?.content;
 
   if (!content) {
-    throw new Error("OpenAI did not return expense extraction content.");
+    throw new Error("OpenAI did not return entry extraction content.");
   }
 
-  const parsed = JSON.parse(content) as { expenses?: unknown };
+  const parsed = JSON.parse(content) as { entries?: unknown };
 
-  if (!parsed.expenses || !Array.isArray(parsed.expenses)) {
-    throw new Error("Expense extraction payload is missing the expenses array.");
+  if (!parsed.entries || !Array.isArray(parsed.entries)) {
+    throw new Error("Entry extraction payload is missing the entries array.");
   }
 
-  const expenses = parsed.expenses
-    .map((expense) => normalizeExpense(expense, rawText))
-    .filter((expense): expense is Expense => expense !== null);
+  const entries = parsed.entries
+    .map((entry) => normalizeEntry(entry, rawText))
+    .filter((entry): entry is Entry => entry !== null);
 
-  return resolveExpenseTags(expenses, tableContext.availableTags, tableContext);
+  return resolveEntryTags(entries, tableContext, rawText);
 }
 
-function normalizeExpense(expense: unknown, fallbackRawText: string): Expense | null {
-  if (!expense || typeof expense !== "object") {
+function normalizeEntry(entry: unknown, fallbackRawText: string): Entry | null {
+  if (!entry || typeof entry !== "object") {
     return null;
   }
 
-  const candidate = expense as Partial<Expense>;
+  const candidate = entry as Partial<Entry>;
   const amount =
     typeof candidate.amount === "number"
       ? candidate.amount
       : Number(candidate.amount);
 
   if (
+    !isEntryType(candidate.type) ||
     typeof candidate.date !== "string" ||
     typeof candidate.description !== "string" ||
     Number.isNaN(amount) ||
@@ -323,6 +349,7 @@ function normalizeExpense(expense: unknown, fallbackRawText: string): Expense | 
   }
 
   return {
+    type: candidate.type,
     date: candidate.date,
     tags: normalizeTags(candidate.tags),
     description: candidate.description.trim(),
@@ -335,13 +362,13 @@ function normalizeExpense(expense: unknown, fallbackRawText: string): Expense | 
   };
 }
 
-async function resolveExpenseTags(
-  expenses: Expense[],
-  existingTags: string[],
-  tableContext?: SheetContext,
-): Promise<Expense[]> {
-  if (expenses.length === 0 || existingTags.length === 0) {
-    return expenses;
+async function resolveEntryTags(
+  entries: Entry[],
+  tableContext: SheetContext,
+  rawText: string,
+): Promise<Entry[]> {
+  if (entries.length === 0) {
+    return entries;
   }
 
   const completion = await openai.chat.completions.create({
@@ -350,29 +377,30 @@ async function resolveExpenseTags(
     response_format: {
       type: "json_schema",
       json_schema: {
-        name: "resolved_expense_tags",
+        name: "resolved_entry_tags",
         strict: true,
         schema: {
           type: "object",
           additionalProperties: false,
           properties: {
-            expenses: {
+            entries: {
               type: "array",
               items: {
                 type: "object",
                 additionalProperties: false,
                 properties: {
                   index: { type: "number" },
+                  type: { type: "string" },
                   tags: {
                     type: "array",
                     items: { type: "string" },
                   },
                 },
-                required: ["index", "tags"],
+                required: ["index", "type", "tags"],
               },
             },
           },
-          required: ["expenses"],
+          required: ["entries"],
         },
       },
     },
@@ -380,28 +408,35 @@ async function resolveExpenseTags(
       {
         role: "system",
         content: [
-          "Нормализуй теги расходов.",
+          "Нормализуй тип и теги финансовых записей.",
           FAMILY_CONTEXT,
-          "Текст расходов может быть на русском языке.",
-          buildTagHistoryPrompt(tableContext?.tagsWithDescriptions ?? []),
-          buildRecentRowsPrompt(tableContext?.recentRows ?? []),
-          buildOlderRowsPrompt(tableContext?.sampledOlderRows ?? []),
-          `Существующие теги: ${existingTags.join(", ")}.`,
-          "Для каждого расхода переиспользуй существующие теги только если это очевидное совпадение или явный синоним.",
-          "Если существующие теги не подходят по смыслу, создай новые короткие теги.",
-          "Верни от 1 до 4 итоговых тегов для каждого расхода.",
-          "Не добавляй нерелевантные теги только потому, что они уже существуют.",
+          "Текст записей может быть на русском языке.",
+          `Исходный текст: ${rawText}`,
+          buildTagHistoryPrompt("расход", tableContext.expenseTagsWithDescriptions),
+          buildTagHistoryPrompt("доход", tableContext.incomeTagsWithDescriptions),
+          buildRecentRowsPrompt(tableContext.recentRows),
+          buildOlderRowsPrompt(tableContext.sampledOlderRows),
+          `Существующие расходные теги: ${tableContext.availableExpenseTags.join(", ")}.`,
+          `Существующие доходные теги: ${tableContext.availableIncomeTags.join(", ")}.`,
+          "Определи для каждой записи type как 'расход' или 'доход'.",
+          "Для расходов переиспользуй только расходные теги, если это очевидное совпадение или явный синоним.",
+          "Для доходов переиспользуй только доходные теги, если это очевидное совпадение или явный синоним.",
+          "Примеры доходов: клиент заплатил, заработала, получил, возврат.",
+          "Возврат денег считай доходом, если деньги пришли обратно.",
+          "Если подходящих существующих тегов нет, создай новые короткие теги в рамках правильного типа.",
+          "Верни от 1 до 4 итоговых тегов для каждой записи.",
           "Все теги должны быть на русском языке, короткими и удобными для фильтрации.",
         ].join(" "),
       },
       {
         role: "user",
         content: JSON.stringify({
-          expenses: expenses.map((expense, index) => ({
+          entries: entries.map((entry, index) => ({
             index,
-            current_tags: expense.tags,
-            description: expense.description,
-            raw_text: expense.raw_text,
+            current_type: entry.type,
+            current_tags: entry.tags,
+            description: entry.description,
+            raw_text: entry.raw_text,
           })),
         }),
       },
@@ -411,62 +446,87 @@ async function resolveExpenseTags(
   const content = completion.choices[0]?.message?.content;
 
   if (!content) {
-    return expenses;
+    return entries;
   }
 
   const parsed = JSON.parse(content) as {
-    expenses?: Array<{ index?: number; tags?: string[] }>;
+    entries?: Array<{ index?: number; type?: string; tags?: string[] }>;
   };
 
-  if (!parsed.expenses || !Array.isArray(parsed.expenses)) {
-    return expenses;
+  if (!parsed.entries || !Array.isArray(parsed.entries)) {
+    return entries;
   }
 
-  const resolvedByIndex = new Map<number, string[]>();
+  const resolvedByIndex = new Map<number, { type: EntryType; tags: string[] }>();
 
-  for (const item of parsed.expenses) {
+  for (const item of parsed.entries) {
     if (
       typeof item.index === "number" &&
       item.index >= 0 &&
-      item.index < expenses.length &&
+      item.index < entries.length &&
+      isEntryType(item.type) &&
       Array.isArray(item.tags)
     ) {
-      resolvedByIndex.set(item.index, reconcileTags(item.tags, existingTags));
+      const existingTags =
+        item.type === "доход"
+          ? tableContext.availableIncomeTags
+          : tableContext.availableExpenseTags;
+      resolvedByIndex.set(item.index, {
+        type: item.type,
+        tags: reconcileTags(item.tags, existingTags),
+      });
     }
   }
 
-  return expenses.map((expense, index) => ({
-    ...expense,
-    tags: resolvedByIndex.get(index) ?? expense.tags,
-  }));
+  return entries.map((entry, index) => {
+    const resolved = resolvedByIndex.get(index);
+    if (!resolved) {
+      const existingTags =
+        entry.type === "доход"
+          ? tableContext.availableIncomeTags
+          : tableContext.availableExpenseTags;
+      return {
+        ...entry,
+        tags: reconcileTags(entry.tags, existingTags),
+      };
+    }
+    return {
+      ...entry,
+      type: resolved.type,
+      tags: resolved.tags,
+    };
+  });
 }
 
-async function appendExpensesToGoogleSheets(expenses: Expense[]): Promise<void> {
+async function appendEntriesToGoogleSheets(entries: Entry[]): Promise<void> {
   const sheets = await getSheetsClient();
   const sheetTitle = await getFirstSheetTitle(sheets);
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${sheetTitle}!A:F`,
+    range: `${sheetTitle}!A:G`,
     valueInputOption: "USER_ENTERED",
     requestBody: {
-      values: expenses.map((expense) => [
-        expense.date,
-        formatTagsForStorage(expense.tags),
-        expense.description,
-        expense.amount,
-        expense.currency,
-        expense.raw_text,
+      values: entries.map((entry) => [
+        entry.date,
+        entry.type,
+        formatTagsForStorage(entry.tags),
+        entry.description,
+        entry.amount,
+        entry.currency,
+        entry.raw_text,
       ]),
     },
   });
 }
 
 type SheetContext = {
-  availableTags: string[];
-  tagsWithDescriptions: Array<{ tag: string; descriptions: string[] }>;
-  recentRows: SheetExpenseRow[];
-  sampledOlderRows: SheetExpenseRow[];
+  availableExpenseTags: string[];
+  availableIncomeTags: string[];
+  expenseTagsWithDescriptions: Array<{ tag: string; descriptions: string[] }>;
+  incomeTagsWithDescriptions: Array<{ tag: string; descriptions: string[] }>;
+  recentRows: SheetEntryRow[];
+  sampledOlderRows: SheetEntryRow[];
 };
 
 async function getSheetContext(): Promise<SheetContext> {
@@ -474,40 +534,74 @@ async function getSheetContext(): Promise<SheetContext> {
   const sheetTitle = await getFirstSheetTitle(sheets);
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${sheetTitle}!A:F`,
+    range: `${sheetTitle}!A:G`,
   });
 
   const rows = parseSheetRows(response.data.values ?? []);
-  const availableTags = Array.from(
+  const availableExpenseTags = Array.from(
     new Map(
-      [...INITIAL_TAGS, ...rows.flatMap((row) => row.tags)]
+      [...INITIAL_EXPENSE_TAGS, ...rows.filter((row) => row.type === "расход").flatMap((row) => row.tags)]
+        .filter((value) => value.toLowerCase() !== "tags")
+        .map((value) => [value.toLowerCase(), value] as const),
+    ).values(),
+  );
+  const availableIncomeTags = Array.from(
+    new Map(
+      [...INITIAL_INCOME_TAGS, ...rows.filter((row) => row.type === "доход").flatMap((row) => row.tags)]
         .filter((value) => value.toLowerCase() !== "tags")
         .map((value) => [value.toLowerCase(), value] as const),
     ).values(),
   );
 
   return {
-    availableTags,
-    tagsWithDescriptions: buildTagDescriptionHistory(rows, availableTags),
+    availableExpenseTags,
+    availableIncomeTags,
+    expenseTagsWithDescriptions: buildTagDescriptionHistory(
+      rows.filter((row) => row.type === "расход"),
+      availableExpenseTags,
+    ),
+    incomeTagsWithDescriptions: buildTagDescriptionHistory(
+      rows.filter((row) => row.type === "доход"),
+      availableIncomeTags,
+    ),
     recentRows: rows.slice(-RECENT_ROWS_LIMIT),
     sampledOlderRows: sampleOlderRows(rows, RECENT_ROWS_LIMIT, OLDER_ROWS_SAMPLE_LIMIT),
   };
 }
 
-function parseSheetRows(values: unknown[][]): SheetExpenseRow[] {
+function parseSheetRows(values: unknown[][]): SheetEntryRow[] {
   return Array.from(
     values
       .slice(1)
-      .map((row) => ({
-        date: String(row[0] ?? "").trim(),
-        tags: parseStoredTags(String(row[1] ?? "")),
-        description: String(row[2] ?? "").trim(),
-        amount: String(row[3] ?? "").trim(),
-        currency: String(row[4] ?? "").trim(),
-        raw_text: String(row[5] ?? "").trim(),
-      }))
-      .filter((row) => row.date || row.description || row.tags.length > 0),
+      .map((row) => parseSheetRow(row))
+      .filter((row): row is SheetEntryRow => row !== null),
   );
+}
+
+function parseSheetRow(row: unknown[]): SheetEntryRow | null {
+  const secondCell = String(row[1] ?? "").trim();
+  const hasExplicitType = isEntryType(secondCell);
+
+  const type = hasExplicitType ? secondCell : "расход";
+  const tagsIndex = hasExplicitType ? 2 : 1;
+  const descriptionIndex = hasExplicitType ? 3 : 2;
+  const amountIndex = hasExplicitType ? 4 : 3;
+  const currencyIndex = hasExplicitType ? 5 : 4;
+  const rawTextIndex = hasExplicitType ? 6 : 5;
+
+  const parsedRow: SheetEntryRow = {
+    date: String(row[0] ?? "").trim(),
+    type,
+    tags: parseStoredTags(String(row[tagsIndex] ?? "")),
+    description: String(row[descriptionIndex] ?? "").trim(),
+    amount: String(row[amountIndex] ?? "").trim(),
+    currency: String(row[currencyIndex] ?? "").trim(),
+    raw_text: String(row[rawTextIndex] ?? "").trim(),
+  };
+
+  return parsedRow.date || parsedRow.description || parsedRow.tags.length > 0
+    ? parsedRow
+    : null;
 }
 
 async function getSheetsClient(): Promise<sheets_v4.Sheets> {
@@ -559,13 +653,19 @@ async function getFirstSheetTitle(sheets: sheets_v4.Sheets): Promise<string> {
   return firstSheetTitlePromise;
 }
 
-function buildConfirmationMessage(expenses: Expense[]): string {
-  const lines = expenses.map(
-    (expense, index) =>
-      `${index + 1}. ${expense.date} | ${expense.amount} ${expense.currency} | ${expense.description} | теги: ${formatTagsForStorage(expense.tags)}`,
+function buildConfirmationMessage(entries: Entry[]): string {
+  const lines = entries.map(
+    (entry, index) =>
+      `${index + 1}. ${entry.date} | ${entry.type} | ${entry.amount} ${entry.currency} | ${entry.description} | теги: ${formatTagsForStorage(entry.tags)}`,
   );
 
-  return [`Сохранил ${expenses.length} расход(ов):`, ...lines].join("\n");
+  const incomeCount = entries.filter((entry) => entry.type === "доход").length;
+  const expenseCount = entries.filter((entry) => entry.type === "расход").length;
+
+  return [
+    `Сохранил ${entries.length} запись(ей): доходов ${incomeCount}, расходов ${expenseCount}.`,
+    ...lines,
+  ].join("\n");
 }
 
 function formatLocalDate(date: Date): string {
@@ -613,7 +713,7 @@ function parseStoredTags(value: string): string[] {
 }
 
 function buildTagDescriptionHistory(
-  rows: SheetExpenseRow[],
+  rows: SheetEntryRow[],
   availableTags: string[],
 ): Array<{ tag: string; descriptions: string[] }> {
   const descriptionsByTag = new Map<string, string[]>();
@@ -644,10 +744,11 @@ function buildTagDescriptionHistory(
 }
 
 function buildTagHistoryPrompt(
+  type: EntryType,
   tagsWithDescriptions: Array<{ tag: string; descriptions: string[] }>,
 ): string {
   if (tagsWithDescriptions.length === 0) {
-    return "История тегов пока пустая.";
+    return `История тегов для типа ${type} пока пустая.`;
   }
 
   const lines = tagsWithDescriptions.map(({ tag, descriptions }) => {
@@ -658,47 +759,47 @@ function buildTagHistoryPrompt(
     return `${tag}: ${descriptions.join(" | ")}`;
   });
 
-  return `Известные теги и связанные с ними описания: ${lines.join("; ")}.`;
+  return `Известные теги для типа ${type} и связанные с ними описания: ${lines.join("; ")}.`;
 }
 
-function buildRecentRowsPrompt(rows: SheetExpenseRow[]): string {
+function buildRecentRowsPrompt(rows: SheetEntryRow[]): string {
   if (rows.length === 0) {
     return "Последних записей в таблице пока нет.";
   }
 
   const lines = rows.map(
     (row) =>
-      `${row.date} | ${formatTagsForStorage(row.tags)} | ${row.description} | ${row.amount} ${row.currency} | ${row.raw_text}`,
+      `${row.date} | ${row.type} | ${formatTagsForStorage(row.tags)} | ${row.description} | ${row.amount} ${row.currency} | ${row.raw_text}`,
   );
 
   return `Последние записи из таблицы: ${lines.join(" ; ")}.`;
 }
 
-function buildOlderRowsPrompt(rows: SheetExpenseRow[]): string {
+function buildOlderRowsPrompt(rows: SheetEntryRow[]): string {
   if (rows.length === 0) {
     return "Дополнительных старых примеров из таблицы пока нет.";
   }
 
   const lines = rows.map(
     (row) =>
-      `${row.date} | ${formatTagsForStorage(row.tags)} | ${row.description} | ${row.amount} ${row.currency} | ${row.raw_text}`,
+      `${row.date} | ${row.type} | ${formatTagsForStorage(row.tags)} | ${row.description} | ${row.amount} ${row.currency} | ${row.raw_text}`,
   );
 
   return `Более старые распределенные примеры из таблицы: ${lines.join(" ; ")}.`;
 }
 
 function sampleOlderRows(
-  rows: SheetExpenseRow[],
+  rows: SheetEntryRow[],
   recentRowsLimit: number,
   sampleLimit: number,
-): SheetExpenseRow[] {
+): SheetEntryRow[] {
   const olderRows = rows.slice(0, Math.max(0, rows.length - recentRowsLimit));
 
   if (olderRows.length <= sampleLimit) {
     return olderRows;
   }
 
-  const sampled: SheetExpenseRow[] = [];
+  const sampled: SheetEntryRow[] = [];
   const lastIndex = olderRows.length - 1;
 
   for (let i = 0; i < sampleLimit; i += 1) {
@@ -714,12 +815,17 @@ function sampleOlderRows(
       array.findIndex(
         (candidate) =>
           candidate.date === row.date &&
+          candidate.type === row.type &&
           candidate.description === row.description &&
           candidate.amount === row.amount &&
           candidate.currency === row.currency &&
           candidate.raw_text === row.raw_text,
       ) === index,
   );
+}
+
+function isEntryType(value: unknown): value is EntryType {
+  return value === "расход" || value === "доход";
 }
 
 function normalizeCurrency(currency: string): string {
