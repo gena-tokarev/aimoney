@@ -157,6 +157,8 @@ const INITIAL_INCOME_TAGS = [
   "Премия",
   "Перевод",
 ];
+const BUTTON_OPEN_SHEET = "Открыть таблицу";
+const BUTTON_RECENT_ENTRIES = "Последние 10";
 
 let sheetsClientPromise: Promise<sheets_v4.Sheets> | null = null;
 let firstSheetInfoPromise: Promise<SheetInfo> | null = null;
@@ -165,6 +167,7 @@ const undoOperations = new Map<string, UndoOperation>();
 bot.start(async (ctx) => {
   await ctx.reply(
     "Отправь мне голосовое или текстовое сообщение с расходами или доходами, и я сохраню их в Google Sheets.",
+    buildMainKeyboard(),
   );
 });
 
@@ -203,6 +206,21 @@ bot.on(message("voice"), async (ctx) => {
 bot.on(message("text"), async (ctx, next) => {
   if (ctx.message.text.startsWith("/start")) {
     await next();
+    return;
+  }
+
+  if (ctx.message.text === BUTTON_OPEN_SHEET) {
+    await ctx.reply(
+      "Открыть таблицу:",
+      Markup.inlineKeyboard([
+        Markup.button.url("Открыть Google Sheet", buildSheetUrl()),
+      ]),
+    );
+    return;
+  }
+
+  if (ctx.message.text === BUTTON_RECENT_ENTRIES) {
+    await ctx.reply(await buildRecentEntriesMessage(10), buildMainKeyboard());
     return;
   }
 
@@ -808,6 +826,32 @@ function buildConfirmationMessage(entries: Entry[]): string {
     `Сохранил ${entries.length} запись(ей): доходов ${incomeCount}, расходов ${expenseCount}.`,
     ...lines,
   ].join("\n");
+}
+
+function buildMainKeyboard() {
+  return Markup.keyboard([
+    [BUTTON_OPEN_SHEET, BUTTON_RECENT_ENTRIES],
+  ]).resize();
+}
+
+function buildSheetUrl(): string {
+  return `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/edit`;
+}
+
+async function buildRecentEntriesMessage(limit: number): Promise<string> {
+  const tableContext = await getSheetContext();
+  const recentEntries = tableContext.recentRows.slice(-limit).reverse();
+
+  if (recentEntries.length === 0) {
+    return "В таблице пока нет записей.";
+  }
+
+  const lines = recentEntries.map(
+    (entry, index) =>
+      `${index + 1}. ${entry.date} | ${entry.type} | ${entry.amount} ${entry.currency} | ${entry.description} | теги: ${formatTagsForStorage(entry.tags)}`,
+  );
+
+  return [`Последние ${recentEntries.length} записей:`, ...lines].join("\n");
 }
 
 function formatLocalDate(date: Date): string {
