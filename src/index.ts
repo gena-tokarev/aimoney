@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 
 import { google, sheets_v4 } from "googleapis";
 import OpenAI from "openai";
-import { Markup, Telegraf } from "telegraf";
+import { Context, Markup, Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
 
 type EntryType = "расход" | "доход";
@@ -49,9 +49,9 @@ type UndoOperation = {
 };
 
 type ReplyContext = {
-  chat?: { id: number };
-  from?: { id: number };
-  reply: (text: string, extra?: unknown) => Promise<{ message_id?: number }>;
+  chat?: Context["chat"];
+  from?: Context["from"];
+  reply: Context["reply"];
 };
 
 const {
