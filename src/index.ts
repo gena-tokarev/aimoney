@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 
 import { google, sheets_v4 } from "googleapis";
 import OpenAI from "openai";
-import { Telegraf } from "telegraf";
+import { Markup, Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
 
 type EntryType = "расход" | "доход";
@@ -30,6 +30,28 @@ type SheetEntryRow = {
   amount: string;
   currency: string;
   raw_text: string;
+};
+
+type SheetInfo = {
+  sheetId: number;
+  title: string;
+};
+
+type UndoOperation = {
+  chatId: number;
+  createdAt: number;
+  endRow: number;
+  messageId: number;
+  operationId: string;
+  sheetId: number;
+  startRow: number;
+  userId: number;
+};
+
+type ReplyContext = {
+  chat?: { id: number };
+  from?: { id: number };
+  reply: (text: string, extra?: unknown) => Promise<{ message_id?: number }>;
 };
 
 const {
@@ -57,6 +79,7 @@ const DEFAULT_CURRENCY = "PLN";
 const RECENT_ROWS_LIMIT = 12;
 const OLDER_ROWS_SAMPLE_LIMIT = 8;
 const TAG_EXAMPLES_PER_TAG = 3;
+const UNDO_WINDOW_MS = 15 * 60 * 1000;
 const FAMILY_CONTEXT = [
   "Контекст семьи:",
   "Мы семья из 3 человек.",
@@ -136,11 +159,12 @@ const INITIAL_INCOME_TAGS = [
 ];
 
 let sheetsClientPromise: Promise<sheets_v4.Sheets> | null = null;
-let firstSheetTitlePromise: Promise<string> | null = null;
+let firstSheetInfoPromise: Promise<SheetInfo> | null = null;
+const undoOperations = new Map<string, UndoOperation>();
 
 bot.start(async (ctx) => {
   await ctx.reply(
-    "Отправь мне голосовое сообщение с расходами или доходами, и я сохраню их в Google Sheets.",
+    "Отправь мне голосовое или текстовое сообщение с расходами или доходами, и я сохраню их в Google Sheets.",
   );
 });
 
@@ -164,17 +188,7 @@ bot.on(message("voice"), async (ctx) => {
       await downloadTelegramVoiceFile(voice.file_id, localAudioPath);
 
       const transcription = await transcribeAudio(localAudioPath);
-      const entries = await extractEntries(transcription);
-
-      if (entries.length === 0) {
-        await ctx.reply(
-          "Я не нашел в сообщении ни расходов, ни доходов. Попробуй еще раз и упомяни сумму, валюту и короткое описание.",
-        );
-        return;
-      }
-
-      await appendEntriesToGoogleSheets(entries);
-      await ctx.reply(buildConfirmationMessage(entries));
+      await processFinanceText(ctx, transcription);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -192,7 +206,55 @@ bot.on(message("text"), async (ctx, next) => {
     return;
   }
 
-  await ctx.reply("Пожалуйста, отправь голосовое сообщение с расходами или доходами.");
+  try {
+    await ctx.reply("Обрабатываю текстовое сообщение...");
+    await processFinanceText(ctx, ctx.message.text);
+  } catch (error) {
+    console.error("Text message handling failed:", error);
+    await ctx.reply(
+      "Не удалось сохранить запись. Попробуй еще раз через минуту.",
+    );
+  }
+});
+
+bot.action(/^undo:([\w-]+)$/, async (ctx) => {
+  const operationId = ctx.match[1];
+  const operation = undoOperations.get(operationId);
+
+  if (!operation) {
+    await ctx.answerCbQuery("Эту операцию уже нельзя отменить.");
+    return;
+  }
+
+  const currentUserId = ctx.from?.id;
+  const currentChatId = ctx.chat?.id;
+
+  if (currentUserId !== operation.userId || currentChatId !== operation.chatId) {
+    await ctx.answerCbQuery("Эту операцию может отменить только тот, кто ее создал.");
+    return;
+  }
+
+  if (Date.now() - operation.createdAt > UNDO_WINDOW_MS) {
+    undoOperations.delete(operationId);
+    await ctx.answerCbQuery("Время для отмены уже истекло.");
+    try {
+      await ctx.editMessageReplyMarkup(undefined);
+    } catch (error) {
+      console.error("Failed to clear expired undo button:", error);
+    }
+    return;
+  }
+
+  try {
+    await deleteSheetRows(operation.sheetId, operation.startRow, operation.endRow);
+    undoOperations.delete(operationId);
+    await ctx.answerCbQuery("Операция отменена.");
+    await ctx.editMessageReplyMarkup(undefined);
+    await ctx.reply("Последняя операция отменена.");
+  } catch (error) {
+    console.error("Undo operation failed:", error);
+    await ctx.answerCbQuery("Не удалось отменить операцию.");
+  }
 });
 
 bot.catch(async (error, ctx) => {
@@ -237,6 +299,47 @@ async function transcribeAudio(audioPath: string): Promise<string> {
   }
 
   return text;
+}
+
+async function processFinanceText(
+  ctx: ReplyContext,
+  rawText: string,
+): Promise<void> {
+  const entries = await extractEntries(rawText);
+
+  if (entries.length === 0) {
+    await ctx.reply(
+      "Я не нашел в сообщении ни расходов, ни доходов. Попробуй еще раз и упомяни сумму, валюту и короткое описание.",
+    );
+    return;
+  }
+
+  const appendResult = await appendEntriesToGoogleSheets(entries);
+  const confirmationText = buildConfirmationMessage(entries);
+
+  if (!ctx.from?.id || !ctx.chat?.id || !appendResult.rowRange) {
+    await ctx.reply(confirmationText);
+    return;
+  }
+
+  const operationId = randomUUID();
+  const replyMessage = await ctx.reply(
+    confirmationText,
+    Markup.inlineKeyboard([
+      Markup.button.callback("Отменить", `undo:${operationId}`),
+    ]),
+  );
+
+  undoOperations.set(operationId, {
+    operationId,
+    userId: ctx.from.id,
+    chatId: ctx.chat.id,
+    sheetId: appendResult.sheetInfo.sheetId,
+    startRow: appendResult.rowRange.startRow,
+    endRow: appendResult.rowRange.endRow,
+    createdAt: Date.now(),
+    messageId: replyMessage.message_id ?? 0,
+  });
 }
 
 async function extractEntries(rawText: string): Promise<Entry[]> {
@@ -515,13 +618,16 @@ async function resolveEntryTags(
   });
 }
 
-async function appendEntriesToGoogleSheets(entries: Entry[]): Promise<void> {
+async function appendEntriesToGoogleSheets(entries: Entry[]): Promise<{
+  rowRange: { endRow: number; startRow: number } | null;
+  sheetInfo: SheetInfo;
+}> {
   const sheets = await getSheetsClient();
-  const sheetTitle = await getFirstSheetTitle(sheets);
+  const sheetInfo = await getFirstSheetInfo(sheets);
 
-  await sheets.spreadsheets.values.append({
+  const response = await sheets.spreadsheets.values.append({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${sheetTitle}!A:G`,
+    range: `${sheetInfo.title}!A:G`,
     valueInputOption: "USER_ENTERED",
     requestBody: {
       values: entries.map((entry) => [
@@ -535,6 +641,11 @@ async function appendEntriesToGoogleSheets(entries: Entry[]): Promise<void> {
       ]),
     },
   });
+
+  return {
+    sheetInfo,
+    rowRange: parseUpdatedRange(response.data.updates?.updatedRange),
+  };
 }
 
 type SheetContext = {
@@ -548,10 +659,10 @@ type SheetContext = {
 
 async function getSheetContext(): Promise<SheetContext> {
   const sheets = await getSheetsClient();
-  const sheetTitle = await getFirstSheetTitle(sheets);
+  const sheetInfo = await getFirstSheetInfo(sheets);
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${sheetTitle}!A:G`,
+    range: `${sheetInfo.title}!A:G`,
   });
 
   const rows = parseSheetRows(response.data.values ?? []);
@@ -646,28 +757,33 @@ async function getSheetsClient(): Promise<sheets_v4.Sheets> {
   return sheetsClientPromise;
 }
 
-async function getFirstSheetTitle(sheets: sheets_v4.Sheets): Promise<string> {
-  if (!firstSheetTitlePromise) {
-    firstSheetTitlePromise = (async () => {
+async function getFirstSheetInfo(sheets: sheets_v4.Sheets): Promise<SheetInfo> {
+  if (!firstSheetInfoPromise) {
+    firstSheetInfoPromise = (async () => {
       const response = await sheets.spreadsheets.get({
         spreadsheetId: GOOGLE_SHEET_ID,
-        fields: "sheets(properties(title))",
+        fields: "sheets(properties(sheetId,title))",
       });
 
-      const title = response.data.sheets?.[0]?.properties?.title;
+      const firstSheet = response.data.sheets?.[0]?.properties;
+      const title = firstSheet?.title;
+      const sheetId = firstSheet?.sheetId;
 
-      if (!title) {
-        throw new Error("Unable to determine the first sheet title.");
+      if (!title || typeof sheetId !== "number") {
+        throw new Error("Unable to determine the first sheet info.");
       }
 
-      return title;
+      return {
+        title,
+        sheetId,
+      };
     })().catch((error) => {
-      firstSheetTitlePromise = null;
+      firstSheetInfoPromise = null;
       throw error;
     });
   }
 
-  return firstSheetTitlePromise;
+  return firstSheetInfoPromise;
 }
 
 function buildConfirmationMessage(entries: Entry[]): string {
@@ -727,6 +843,29 @@ function parseStoredTags(value: string): string[] {
     .map((part) => part.trim())
     .filter(Boolean)
     .map((part) => part.replace(/\s+/g, " "));
+}
+
+function parseUpdatedRange(
+  updatedRange: string | null | undefined,
+): { endRow: number; startRow: number } | null {
+  if (!updatedRange) {
+    return null;
+  }
+
+  const match = updatedRange.match(/![A-Z]+(\d+):[A-Z]+(\d+)/);
+
+  if (!match) {
+    return null;
+  }
+
+  const startRow = Number(match[1]);
+  const endRow = Number(match[2]);
+
+  if (Number.isNaN(startRow) || Number.isNaN(endRow)) {
+    return null;
+  }
+
+  return { startRow, endRow };
 }
 
 function buildTagDescriptionHistory(
@@ -839,6 +978,32 @@ function sampleOlderRows(
           candidate.raw_text === row.raw_text,
       ) === index,
   );
+}
+
+async function deleteSheetRows(
+  sheetId: number,
+  startRow: number,
+  endRow: number,
+): Promise<void> {
+  const sheets = await getSheetsClient();
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId,
+              dimension: "ROWS",
+              startIndex: startRow - 1,
+              endIndex: endRow,
+            },
+          },
+        },
+      ],
+    },
+  });
 }
 
 function isEntryType(value: unknown): value is EntryType {
