@@ -30,6 +30,7 @@ type SheetEntryRow = {
   amount: string;
   currency: string;
   raw_text: string;
+  operation_id?: string;
 };
 
 type SheetInfo = {
@@ -40,11 +41,10 @@ type SheetInfo = {
 type UndoOperation = {
   chatId: number;
   createdAt: number;
-  endRow: number;
   messageId: number;
   operationId: string;
   sheetId: number;
-  startRow: number;
+  sheetTitle: string;
   userId: number;
 };
 
@@ -246,8 +246,17 @@ bot.action(/^undo:([\w-]+)$/, async (ctx) => {
   }
 
   try {
-    await deleteSheetRows(operation.sheetId, operation.startRow, operation.endRow);
+    const deletedRowsCount = await deleteRowsByOperationId(
+      operation.sheetId,
+      operation.sheetTitle,
+      operation.operationId,
+    );
     undoOperations.delete(operationId);
+    if (deletedRowsCount === 0) {
+      await ctx.answerCbQuery("Записи для отмены не найдены.");
+      await ctx.editMessageReplyMarkup(undefined);
+      return;
+    }
     await ctx.answerCbQuery("Операция отменена.");
     await ctx.editMessageReplyMarkup(undefined);
     await ctx.reply("Последняя операция отменена.");
@@ -314,15 +323,15 @@ async function processFinanceText(
     return;
   }
 
-  const appendResult = await appendEntriesToGoogleSheets(entries);
+  const operationId = randomUUID();
+  const appendResult = await appendEntriesToGoogleSheets(entries, operationId);
   const confirmationText = buildConfirmationMessage(entries);
 
-  if (!ctx.from?.id || !ctx.chat?.id || !appendResult.rowRange) {
+  if (!ctx.from?.id || !ctx.chat?.id) {
     await ctx.reply(confirmationText);
     return;
   }
 
-  const operationId = randomUUID();
   const replyMessage = await ctx.reply(
     confirmationText,
     Markup.inlineKeyboard([
@@ -335,8 +344,7 @@ async function processFinanceText(
     userId: ctx.from.id,
     chatId: ctx.chat.id,
     sheetId: appendResult.sheetInfo.sheetId,
-    startRow: appendResult.rowRange.startRow,
-    endRow: appendResult.rowRange.endRow,
+    sheetTitle: appendResult.sheetInfo.title,
     createdAt: Date.now(),
     messageId: replyMessage.message_id ?? 0,
   });
@@ -618,16 +626,15 @@ async function resolveEntryTags(
   });
 }
 
-async function appendEntriesToGoogleSheets(entries: Entry[]): Promise<{
-  rowRange: { endRow: number; startRow: number } | null;
+async function appendEntriesToGoogleSheets(entries: Entry[], operationId: string): Promise<{
   sheetInfo: SheetInfo;
 }> {
   const sheets = await getSheetsClient();
   const sheetInfo = await getFirstSheetInfo(sheets);
 
-  const response = await sheets.spreadsheets.values.append({
+  await sheets.spreadsheets.values.append({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${sheetInfo.title}!A:G`,
+    range: `${sheetInfo.title}!A:H`,
     valueInputOption: "USER_ENTERED",
     requestBody: {
       values: entries.map((entry) => [
@@ -638,13 +645,13 @@ async function appendEntriesToGoogleSheets(entries: Entry[]): Promise<{
         entry.amount,
         entry.currency,
         entry.raw_text,
+        operationId,
       ]),
     },
   });
 
   return {
     sheetInfo,
-    rowRange: parseUpdatedRange(response.data.updates?.updatedRange),
   };
 }
 
@@ -662,7 +669,7 @@ async function getSheetContext(): Promise<SheetContext> {
   const sheetInfo = await getFirstSheetInfo(sheets);
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${sheetInfo.title}!A:G`,
+    range: `${sheetInfo.title}!A:H`,
   });
 
   const rows = parseSheetRows(response.data.values ?? []);
@@ -716,6 +723,7 @@ function parseSheetRow(row: unknown[]): SheetEntryRow | null {
   const amountIndex = hasExplicitType ? 4 : 3;
   const currencyIndex = hasExplicitType ? 5 : 4;
   const rawTextIndex = hasExplicitType ? 6 : 5;
+  const operationIdIndex = hasExplicitType ? 7 : 6;
 
   const parsedRow: SheetEntryRow = {
     date: String(row[0] ?? "").trim(),
@@ -725,6 +733,7 @@ function parseSheetRow(row: unknown[]): SheetEntryRow | null {
     amount: String(row[amountIndex] ?? "").trim(),
     currency: String(row[currencyIndex] ?? "").trim(),
     raw_text: String(row[rawTextIndex] ?? "").trim(),
+    operation_id: String(row[operationIdIndex] ?? "").trim() || undefined,
   };
 
   return parsedRow.date || parsedRow.description || parsedRow.tags.length > 0
@@ -845,29 +854,6 @@ function parseStoredTags(value: string): string[] {
     .map((part) => part.replace(/\s+/g, " "));
 }
 
-function parseUpdatedRange(
-  updatedRange: string | null | undefined,
-): { endRow: number; startRow: number } | null {
-  if (!updatedRange) {
-    return null;
-  }
-
-  const match = updatedRange.match(/![A-Z]+(\d+):[A-Z]+(\d+)/);
-
-  if (!match) {
-    return null;
-  }
-
-  const startRow = Number(match[1]);
-  const endRow = Number(match[2]);
-
-  if (Number.isNaN(startRow) || Number.isNaN(endRow)) {
-    return null;
-  }
-
-  return { startRow, endRow };
-}
-
 function buildTagDescriptionHistory(
   rows: SheetEntryRow[],
   availableTags: string[],
@@ -980,30 +966,47 @@ function sampleOlderRows(
   );
 }
 
-async function deleteSheetRows(
+async function deleteRowsByOperationId(
   sheetId: number,
-  startRow: number,
-  endRow: number,
-): Promise<void> {
+  sheetTitle: string,
+  operationId: string,
+): Promise<number> {
   const sheets = await getSheetsClient();
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${sheetTitle}!H:H`,
+  });
+
+  const rowsToDelete = (response.data.values ?? [])
+    .map((row, index) => ({
+      rowNumber: index + 1,
+      value: String(row[0] ?? "").trim(),
+    }))
+    .filter((row) => row.value === operationId)
+    .map((row) => row.rowNumber)
+    .sort((a, b) => b - a);
+
+  if (rowsToDelete.length === 0) {
+    return 0;
+  }
 
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: GOOGLE_SHEET_ID,
     requestBody: {
-      requests: [
-        {
-          deleteDimension: {
-            range: {
-              sheetId,
-              dimension: "ROWS",
-              startIndex: startRow - 1,
-              endIndex: endRow,
-            },
+      requests: rowsToDelete.map((rowNumber) => ({
+        deleteDimension: {
+          range: {
+            sheetId,
+            dimension: "ROWS",
+            startIndex: rowNumber - 1,
+            endIndex: rowNumber,
           },
         },
-      ],
+      })),
     },
   });
+
+  return rowsToDelete.length;
 }
 
 function isEntryType(value: unknown): value is EntryType {
